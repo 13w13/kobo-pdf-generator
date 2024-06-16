@@ -87,7 +87,7 @@ POST /api/http_trigger
 
 ### Request Access Token
 
-If you wish to use the API for testing, access can be provided through an access token to call the POST function. Please request access via this form. We will get back to you quickly.
+If you wish to use the API for testing, access can be provided through an access token to call the POST function. Please request access via [this form](https://forms.gle/N3Z2yKSa5ERNzjHNA). We will get back to you quickly.
 
 ### License
 This project is licensed under the MIT License.
