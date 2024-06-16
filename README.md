@@ -19,22 +19,6 @@ The KoboToolbox PDF Generator function app is designed to streamline the process
 ### Installation
 
 1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/your-github-username/kobo-pdf-generator.git
-   cd kobo-pdf-generator
-
-
-## Setting Up Your Own Azure Function and Blob Storage
-
-### Prerequisites
-
-- Python 3.10
-- Azure Functions Core Tools
-- Azure Storage Account
-
-### Installation
-
-1. **Clone the Repository**:
     ```bash
     git clone https://github.com/your-github-username/kobo-pdf-generator.git
     cd kobo-pdf-generator
@@ -63,9 +47,9 @@ The KoboToolbox PDF Generator function app is designed to streamline the process
     ```
 
 ## Using the API Endpoint
-
-POST /api/http_trigger
-
+    ```bash
+    POST /api/http_trigger
+ ```
 ### Request Body
 
 ```json
