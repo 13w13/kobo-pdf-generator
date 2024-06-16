@@ -49,7 +49,8 @@ The KoboToolbox PDF Generator function app is designed to streamline the process
 ## Using the API Endpoint
     ```bash
     POST /api/http_trigger
- ```
+    ```
+
 ### Request Body
 
 ```json
