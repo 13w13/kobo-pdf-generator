@@ -9,9 +9,9 @@ import json
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-WAIT_TIME = 10  # seconds
+WAIT_TIME = 20  # seconds
 
-async def fetch_and_convert_to_pdf(login_url, view_url, username, password, headers):
+async def fetch_and_convert_to_pdf(login_url, view_url, username, password, headers, blob_service_client, container_name, submission_id):
     browser = await launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
     page = await browser.newPage()
 
@@ -22,17 +22,27 @@ async def fetch_and_convert_to_pdf(login_url, view_url, username, password, head
     await page.type('input[name="password"]', password)
     await page.click('button[type="submit"]')
     await page.waitForNavigation({'waitUntil': 'networkidle2'})
-    login_screenshot_path = f'/tmp/login_screenshot.png'
-    await page.screenshot({'path': login_screenshot_path})
+    login_screenshot = await page.screenshot({'encoding': 'binary'})
     logging.info(f"Login screenshot saved")
+
+    # Upload login screenshot
+    login_screenshot_blob_name = f'{submission_id}_login_screenshot.png'
+    login_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=login_screenshot_blob_name)
+    login_screenshot_blob_client.upload_blob(login_screenshot, blob_type="BlockBlob", overwrite=True)
+    login_screenshot_url = login_screenshot_blob_client.url
 
     # 2. Fetch the view URL
     await page.setExtraHTTPHeaders(headers)
     logging.info(f"Fetching view URL")
     await page.goto(view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
-    initial_screenshot_path = f'/tmp/initial_screenshot.png'
-    await page.screenshot({'path': initial_screenshot_path})
+    initial_screenshot = await page.screenshot({'encoding': 'binary'})
     logging.info(f"Initial screenshot saved")
+
+    # Upload initial screenshot
+    initial_screenshot_blob_name = f'{submission_id}_initial_screenshot.png'
+    initial_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=initial_screenshot_blob_name)
+    initial_screenshot_blob_client.upload_blob(initial_screenshot, blob_type="BlockBlob", overwrite=True)
+    initial_screenshot_url = initial_screenshot_blob_client.url
 
     # Ensure the page has content
     content = await page.content()
@@ -46,15 +56,20 @@ async def fetch_and_convert_to_pdf(login_url, view_url, username, password, head
     if not final_view_url:
         logging.error("Failed to fetch the final view URL")
         await browser.close()
-        return None, login_screenshot_path, initial_screenshot_path, None
+        return None, login_screenshot_url, initial_screenshot_url, None
 
     # 3. Navigate to final view URL
     logging.info(f"Navigating to final view URL")
     await page.goto(final_view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
     await asyncio.sleep(WAIT_TIME)
-    final_screenshot_path = f'/tmp/final_screenshot.png'
-    await page.screenshot({'path': final_screenshot_path})
+    final_screenshot = await page.screenshot({'encoding': 'binary'})
     logging.info(f"Final screenshot saved")
+
+    # Upload final screenshot
+    final_screenshot_blob_name = f'{submission_id}_final_screenshot.png'
+    final_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=final_screenshot_blob_name)
+    final_screenshot_blob_client.upload_blob(final_screenshot, blob_type="BlockBlob", overwrite=True)
+    final_screenshot_url = final_screenshot_blob_client.url
 
     # Ensure the page has content
     content = await page.content()
@@ -63,7 +78,7 @@ async def fetch_and_convert_to_pdf(login_url, view_url, username, password, head
     # Generate PDF
     pdf = await page.pdf({'format': 'A4'})
     await browser.close()
-    return pdf, login_screenshot_path, initial_screenshot_path, final_screenshot_path
+    return pdf, login_screenshot_url, initial_screenshot_url, final_screenshot_url
 
 @app.function_name(name="HttpTrigger")
 @app.route(route="http_trigger")
@@ -102,9 +117,14 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     }
 
     try:
+        # Initialize Blob Service Client
+        connect_str = os.getenv('AzureWebJobsStorage')
+        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+        container_name = 'pdfs'
+
         # Fetch and convert the HTML content to PDF using pyppeteer
-        pdf, login_screenshot_path, initial_screenshot_path, final_screenshot_path = await fetch_and_convert_to_pdf(
-            login_url, view_url, username, password, headers)
+        pdf, login_screenshot_url, initial_screenshot_url, final_screenshot_url = await fetch_and_convert_to_pdf(
+            login_url, view_url, username, password, headers, blob_service_client, container_name, submission_id)
 
         if pdf is None:
             return func.HttpResponse(
@@ -112,20 +132,17 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500
             )
 
-        # Upload to Azure Blob Storage
-        connect_str = os.getenv('AzureWebJobsStorage')
-        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-        container_name = 'pdfs'
-
+        # Upload PDF
         blob_name = f'{submission_id}.pdf'
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-
-        # Upload the blob, overwrite if it already exists
         blob_client.upload_blob(pdf, blob_type="BlockBlob", overwrite=True)
 
         return func.HttpResponse(
             json.dumps({
-                "pdf_url": blob_client.url
+                "pdf_url": blob_client.url,
+                "login_screenshot_url": login_screenshot_url,
+                "initial_screenshot_url": initial_screenshot_url,
+                "final_screenshot_url": final_screenshot_url
             }),
             status_code=200,
             mimetype="application/json"
