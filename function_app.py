@@ -1,155 +1,132 @@
 import logging
-import requests
 import azure.functions as func
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 import os
 import asyncio
 from pyppeteer import launch
 import json
+from datetime import datetime, timedelta
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-WAIT_TIME = 20  # seconds
+WAIT_TIME = 300  # seconds
+MAX_ATTEMPTS = 20
+MIN_CONTENT_LENGTH = 1000
+
+async def check_page_loaded(page):
+    return await page.evaluate('''() => {
+        const loadingIndicator = document.querySelector('.main-loader');
+        if (loadingIndicator && window.getComputedStyle(loadingIndicator).display !== 'none') {
+            return false;
+        }
+        return document.body.innerText.length > 1000;
+    }''')
 
 async def fetch_and_convert_to_pdf(login_url, view_url, username, password, headers, blob_service_client, container_name, submission_id):
-    browser = await launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-    page = await browser.newPage()
+    browser = None
+    try:
+        browser = await launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        page = await browser.newPage()
 
-    # 1. Navigate to login page
-    logging.info(f"Navigating to login URL")
-    await page.goto(login_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
-    await page.type('input[name="login"]', username)
-    await page.type('input[name="password"]', password)
-    await page.click('button[type="submit"]')
-    await page.waitForNavigation({'waitUntil': 'networkidle2'})
-    login_screenshot = await page.screenshot({'encoding': 'binary'})
-    logging.info(f"Login screenshot saved")
+        logging.info("Navigating to login URL")
+        await page.goto(login_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
+        await page.type('input[name="login"]', username)
+        await page.type('input[name="password"]', password)
+        await page.click('button[type="submit"]')
+        await page.waitForNavigation({'waitUntil': 'networkidle2'})
 
-    # Upload login screenshot
-    login_screenshot_blob_name = f'{submission_id}_login_screenshot.png'
-    login_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=login_screenshot_blob_name)
-    login_screenshot_blob_client.upload_blob(login_screenshot, blob_type="BlockBlob", overwrite=True)
-    login_screenshot_url = login_screenshot_blob_client.url
+        logging.info("Fetching view URL")
+        await page.setExtraHTTPHeaders(headers)
+        await page.goto(view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
 
-    # 2. Fetch the view URL
-    await page.setExtraHTTPHeaders(headers)
-    logging.info(f"Fetching view URL")
-    await page.goto(view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
-    initial_screenshot = await page.screenshot({'encoding': 'binary'})
-    logging.info(f"Initial screenshot saved")
+        response_json = await page.evaluate("document.body.innerText")
+        data = json.loads(response_json)
+        final_view_url = data.get('url')
+        if not final_view_url:
+            raise ValueError("Failed to fetch the final view URL")
 
-    # Upload initial screenshot
-    initial_screenshot_blob_name = f'{submission_id}_initial_screenshot.png'
-    initial_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=initial_screenshot_blob_name)
-    initial_screenshot_blob_client.upload_blob(initial_screenshot, blob_type="BlockBlob", overwrite=True)
-    initial_screenshot_url = initial_screenshot_blob_client.url
+        logging.info(f"Navigating to final view URL: {final_view_url}")
+        await page.goto(final_view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
+        
+        for attempt in range(MAX_ATTEMPTS):
+            if await check_page_loaded(page):
+                logging.info(f"Final view content loaded on attempt {attempt + 1}")
+                break
+            if attempt < MAX_ATTEMPTS - 1:
+                logging.warning(f"Content not fully loaded, retrying (Attempt {attempt + 1}/{MAX_ATTEMPTS})")
+                await asyncio.sleep(WAIT_TIME / MAX_ATTEMPTS)
+        else:
+            raise TimeoutError("Failed to load final view content after multiple attempts")
 
-    # Ensure the page has content
-    content = await page.content()
-    logging.info(f"Initial page content length: {len(content)}")
+        await asyncio.sleep(5)  # Extra wait for any final rendering
 
-    # Extract the view URL from the response
-    response_json = await page.evaluate("document.body.innerText")
-    logging.info(f"Response JSON fetched")
-    data = json.loads(response_json)
-    final_view_url = data.get('url')
-    if not final_view_url:
-        logging.error("Failed to fetch the final view URL")
-        await browser.close()
-        return None, login_screenshot_url, initial_screenshot_url, None
+        final_screenshot = await page.screenshot({'encoding': 'binary', 'fullPage': True})
+        pdf = await page.pdf({'format': 'A4', 'printBackground': True})
 
-    # 3. Navigate to final view URL
-    logging.info(f"Navigating to final view URL")
-    await page.goto(final_view_url, {'waitUntil': 'networkidle2', 'timeout': 60000})
-    await asyncio.sleep(WAIT_TIME)
-    final_screenshot = await page.screenshot({'encoding': 'binary'})
-    logging.info(f"Final screenshot saved")
+        return pdf, final_screenshot, final_view_url
 
-    # Upload final screenshot
-    final_screenshot_blob_name = f'{submission_id}_final_screenshot.png'
-    final_screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=final_screenshot_blob_name)
-    final_screenshot_blob_client.upload_blob(final_screenshot, blob_type="BlockBlob", overwrite=True)
-    final_screenshot_url = final_screenshot_blob_client.url
+    finally:
+        if browser:
+            await browser.close()
 
-    # Ensure the page has content
-    content = await page.content()
-    logging.info(f"Final page content length: {len(content)}")
-
-    # Generate PDF
-    pdf = await page.pdf({'format': 'A4'})
-    await browser.close()
-    return pdf, login_screenshot_url, initial_screenshot_url, final_screenshot_url
+def upload_blob(blob_client, data):
+    blob_client.upload_blob(data, blob_type="BlockBlob", overwrite=True)
+    return blob_client.url
 
 @app.function_name(name="HttpTrigger")
 @app.route(route="http_trigger")
 async def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function processed a request.')
-
     try:
         req_body = req.get_json()
-        logging.info("Received request body")
-    except ValueError:
-        logging.error("Error parsing request body")
-        return func.HttpResponse(
-            "Invalid request body",
-            status_code=400
-        )
+        kobo_server = req_body['kobo_server']
+        username = req_body['username']
+        password = req_body['password']
+        kobo_api_token = req_body['kobo_api_token']
+        asset_id = req_body['asset_id']
+        submission_id = req_body['submission_id']
 
-    kobo_server = req_body.get('kobo_server')
-    username = req_body.get('username')
-    password = req_body.get('password')
-    kobo_api_token = req_body.get('kobo_api_token')
-    asset_id = req_body.get('asset_id')
-    submission_id = req_body.get('submission_id')
+        login_url = f"https://{kobo_server}/accounts/login/"
+        view_url = f"https://{kobo_server}/api/v2/assets/{asset_id}/data/{submission_id}/enketo/view/"
+        headers = {"Authorization": f"Token {kobo_api_token}", "Accept": "application/json"}
 
-    if not all([kobo_server, username, password, kobo_api_token, asset_id, submission_id]):
-        logging.error("Missing required parameters")
-        return func.HttpResponse(
-            "Please pass the kobo_server, username, password, kobo_api_token, asset_id, and submission_id in the request body",
-            status_code=400
-        )
-
-    login_url = f"https://{kobo_server}/accounts/login/"
-    view_url = f"https://{kobo_server}/api/v2/assets/{asset_id}/data/{submission_id}/enketo/view/"
-    headers = {
-        "Authorization": f"Token {kobo_api_token}",
-        "Accept": "application/json"
-    }
-
-    try:
-        # Initialize Blob Service Client
-        connect_str = os.getenv('AzureWebJobsStorage')
+        connect_str = os.environ['AzureWebJobsStorage']
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         container_name = 'pdfs'
 
-        # Fetch and convert the HTML content to PDF using pyppeteer
-        pdf, login_screenshot_url, initial_screenshot_url, final_screenshot_url = await fetch_and_convert_to_pdf(
+        pdf, screenshot, final_view_url = await fetch_and_convert_to_pdf(
             login_url, view_url, username, password, headers, blob_service_client, container_name, submission_id)
 
-        if pdf is None:
-            return func.HttpResponse(
-                "Error generating PDF from the provided HTML and CSS",
-                status_code=500
-            )
+        pdf_blob_name = f'{submission_id}.pdf'
+        screenshot_blob_name = f'{submission_id}_screenshot.png'
 
-        # Upload PDF
-        blob_name = f'{submission_id}.pdf'
-        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-        blob_client.upload_blob(pdf, blob_type="BlockBlob", overwrite=True)
+        pdf_blob_client = blob_service_client.get_blob_client(container=container_name, blob=pdf_blob_name)
+        screenshot_blob_client = blob_service_client.get_blob_client(container=container_name, blob=screenshot_blob_name)
+
+        # Upload blobs without using await
+        pdf_url = upload_blob(pdf_blob_client, pdf)
+        screenshot_url = upload_blob(screenshot_blob_client, screenshot)
+
+        account_name = os.environ['AZURE_STORAGE_ACCOUNT_NAME']
+        account_key = os.environ['AZURE_STORAGE_ACCOUNT_KEY']
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=pdf_blob_name,
+            account_key=account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(hours=1)
+        )
+        pdf_url_with_sas = f"{pdf_url}?{sas_token}"
 
         return func.HttpResponse(
             json.dumps({
-                "pdf_url": blob_client.url,
-                "login_screenshot_url": login_screenshot_url,
-                "initial_screenshot_url": initial_screenshot_url,
-                "final_screenshot_url": final_screenshot_url
+                "pdf_url": pdf_url_with_sas,
+                "screenshot_url": screenshot_url,
+                "final_view_url": final_view_url
             }),
             status_code=200,
             mimetype="application/json"
         )
     except Exception as e:
         logging.error(f"Error: {str(e)}")
-        return func.HttpResponse(
-            f"Error generating PDF: {str(e)}",
-            status_code=500
-        )
+        return func.HttpResponse(f"Error generating PDF: {str(e)}", status_code=500)
